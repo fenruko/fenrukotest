@@ -307,6 +307,59 @@
             border: 1px solid var(--border-color);
             margin-right: 5px;
         }
+        
+        #voice-participants-container {
+    margin-top: 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    padding: 10px;
+    background-color: var(--chat-bg);
+}
+
+.participant-item {
+    display: flex;
+    align-items: center;
+    padding: 5px;
+    margin-bottom: 5px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.participant-name {
+    flex-grow: 1;
+    font-weight: bold;
+}
+
+.speaking-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background-color: #4CAF50;
+    margin-right: 10px;
+    display: none;
+}
+
+.speaking-indicator.active {
+    display: block;
+    animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.5; }
+    100% { opacity: 1; }
+}
+
+.participant-controls button {
+    margin: 0 5px;
+    padding: 5px 10px;
+    font-size: 12px;
+}
+
+.muted-indicator {
+    color: #ff5252;
+    margin-right: 10px;
+    font-style: italic;
+}
     </style>
 </head>
 <body>
@@ -334,6 +387,11 @@
                 <button id="join-voice">Join Voice Channel</button>
                 <button id="leave-voice" style="display: none;">Leave Voice Channel</button>
                 <div id="voice-status">Voice Channel: Inactive</div>
+            </div>
+            
+            <div id="voice-participants-container" style="display: none;">
+                <h3>Voice Channel Participants</h3>
+                <div id="voice-participants-list"></div>
             </div>
             
             <div id="username-container">
@@ -1142,5 +1200,254 @@ window.debugVoice = function() {
         
         deleteExpiredMessages();
     </script>
+    
+    <script>
+// Voice participant tracking
+let localAudioTrack = null;
+let participantsSpeaking = {};
+let isMuted = false;
+
+// Update the join voice function to include participant list functionality
+joinVoiceButton.addEventListener('click', async () => {
+    try {
+        // Previous code remains the same...
+        voiceStatus.textContent = 'Voice Channel: Connecting...';
+        
+        localStream = await navigator.mediaDevices.getUserMedia({ 
+            audio: true,
+            echoCancellation: true,
+            noiseSuppression: true
+        });
+        
+        // Show the participants container when joining
+        document.getElementById('voice-participants-container').style.display = 'block';
+        
+        // Store the audio track for mute/unmute functionality
+        localAudioTrack = localStream.getAudioTracks()[0];
+        
+        joinVoiceButton.style.display = 'none';
+        leaveVoiceButton.style.display = 'inline-block';
+        voiceStatus.textContent = 'Voice Channel: Active';
+        isInVoiceChannel = true;
+
+        // Announce presence with additional data
+        const participantRef = voiceChannelRef.child('participants').child(userId);
+        await participantRef.set({
+            username: username,
+            timestamp: firebase.database.ServerValue.TIMESTAMP,
+            muted: false
+        });
+
+        // Set up audio analysis for local speaking detection
+        setupAudioAnalysis(localStream);
+        
+        // Rest of the function remains the same...
+        
+        // Listen for participant mute status changes
+        voiceChannelRef.child('participants').on('child_changed', (snapshot) => {
+            const participantId = snapshot.key;
+            const participantData = snapshot.val();
+            updateParticipantList();
+        });
+        
+        // Initial participant list update
+        updateParticipantList();
+        
+    } catch (error) {
+        console.error("Error joining voice channel:", error);
+        voiceStatus.textContent = 'Error joining voice channel: ' + error.message;
+        resetVoiceChannel();
+    }
+});
+
+// Setup audio analysis to detect when the user is speaking
+function setupAudioAnalysis(stream) {
+    try {
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const analyser = audioContext.createAnalyser();
+        const microphone = audioContext.createMediaStreamSource(stream);
+        const javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
+        
+        analyser.smoothingTimeConstant = 0.8;
+        analyser.fftSize = 1024;
+        
+        microphone.connect(analyser);
+        analyser.connect(javascriptNode);
+        javascriptNode.connect(audioContext.destination);
+        
+        javascriptNode.onaudioprocess = function() {
+            const array = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(array);
+            let values = 0;
+            
+            const length = array.length;
+            for (let i = 0; i < length; i++) {
+                values += (array[i]);
+            }
+            
+            const average = values / length;
+            // Consider speaking if average volume is above threshold
+            const isSpeaking = average > 15; // Adjust threshold as needed
+            
+            if (isSpeaking !== participantsSpeaking[userId]) {
+                participantsSpeaking[userId] = isSpeaking;
+                
+                // Update local speaking indicator
+                updateSpeakingIndicator(userId, isSpeaking);
+                
+                // Broadcast speaking status to other participants
+                if (isInVoiceChannel) {
+                    voiceChannelRef.child('participants').child(userId).update({
+                        speaking: isSpeaking
+                    });
+                }
+            }
+        };
+    } catch (e) {
+        console.error("Error setting up audio analysis:", e);
+    }
+}
+
+// Update participant list
+function updateParticipantList() {
+    if (!isInVoiceChannel) return;
+    
+    const participantsList = document.getElementById('voice-participants-list');
+    participantsList.innerHTML = '';
+    
+    voiceChannelRef.child('participants').once('value', (snapshot) => {
+        snapshot.forEach((childSnapshot) => {
+            const participantId = childSnapshot.key;
+            const participant = childSnapshot.val();
+            
+            const participantItem = document.createElement('div');
+            participantItem.className = 'participant-item';
+            participantItem.id = `participant-${participantId}`;
+            
+            const speakingIndicator = document.createElement('div');
+            speakingIndicator.className = 'speaking-indicator';
+            speakingIndicator.id = `speaking-${participantId}`;
+            if (participant.speaking) {
+                speakingIndicator.classList.add('active');
+            }
+            participantItem.appendChild(speakingIndicator);
+            
+            const nameElement = document.createElement('div');
+            nameElement.className = 'participant-name';
+            nameElement.textContent = participant.username || 'Anonymous';
+            
+            // Show if participant is muted
+            if (participant.muted) {
+                const mutedIndicator = document.createElement('span');
+                mutedIndicator.className = 'muted-indicator';
+                mutedIndicator.textContent = '(Muted)';
+                nameElement.appendChild(mutedIndicator);
+            }
+            
+            participantItem.appendChild(nameElement);
+            
+            // Only add controls to your own participant
+            if (participantId === userId) {
+                const controlsElement = document.createElement('div');
+                controlsElement.className = 'participant-controls';
+                
+                const muteButton = document.createElement('button');
+                muteButton.textContent = participant.muted ? 'Unmute' : 'Mute';
+                muteButton.onclick = function() {
+                    toggleMute();
+                };
+                
+                controlsElement.appendChild(muteButton);
+                participantItem.appendChild(controlsElement);
+            }
+            
+            participantsList.appendChild(participantItem);
+            
+            // Update speaking indicator for existing participants
+            updateSpeakingIndicator(participantId, participant.speaking);
+        });
+    });
+}
+
+// Toggle mute status
+function toggleMute() {
+    if (!localAudioTrack) return;
+    
+    isMuted = !isMuted;
+    localAudioTrack.enabled = !isMuted;
+    
+    // Update mute status in database
+    voiceChannelRef.child('participants').child(userId).update({
+        muted: isMuted
+    });
+    
+    // Update the button text
+    updateParticipantList();
+}
+
+// Update speaking indicator for a participant
+function updateSpeakingIndicator(participantId, isSpeaking) {
+    const indicator = document.getElementById(`speaking-${participantId}`);
+    if (indicator) {
+        if (isSpeaking) {
+            indicator.classList.add('active');
+        } else {
+            indicator.classList.remove('active');
+        }
+    }
+}
+
+// Listen for speaking status changes
+voiceChannelRef.child('participants').on('child_changed', (snapshot) => {
+    const participantId = snapshot.key;
+    const participant = snapshot.val();
+    
+    if (participant.speaking !== undefined) {
+        updateSpeakingIndicator(participantId, participant.speaking);
+    }
+});
+
+// Modify the resetVoiceChannel function to hide participant list
+function resetVoiceChannel() {
+    console.log("Resetting voice channel");
+    isInVoiceChannel = false;
+    
+    // Hide the participants container
+    document.getElementById('voice-participants-container').style.display = 'none';
+    
+    // Rest of the original function
+    if (localStream) {
+        localStream.getTracks().forEach(track => {
+            track.stop();
+            console.log("Stopped local track:", track.kind);
+        });
+        localStream = null;
+        localAudioTrack = null;
+    }
+    
+    // Clear speaking status
+    participantsSpeaking = {};
+    isMuted = false;
+    
+    // Rest of the function remains the same...
+    const localAudio = document.getElementById('local-audio');
+    if (localAudio) {
+        localAudio.pause();
+        localAudio.srcObject = null;
+        localAudio.remove();
+    }
+
+    Object.keys(peerConnections).forEach(cleanupPeerConnection);
+    peerConnections = {};
+
+    if (userId) {
+        voiceChannelRef.child('participants').child(userId).remove();
+    }
+
+    joinVoiceButton.style.display = 'inline-block';
+    leaveVoiceButton.style.display = 'none';
+    voiceStatus.textContent = 'Voice Channel: Inactive';
+}
+</script>
 </body>
 </html>
