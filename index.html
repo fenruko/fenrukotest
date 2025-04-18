@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+%<div class="control-container"><!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -74,6 +74,18 @@
             background-image: var(--bg-image);
             background-size: cover;
             background-position: center;
+        }
+
+                #voice-channel-container {
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        #voice-status {
+            font-style: italic;
+            color: var(--typing-color);
         }
 
         #message-input {
@@ -317,6 +329,12 @@
                     <span>A+</span>
                 </div>
             </div>
+
+            <div id="voice-channel-container">
+                <button id="join-voice">Join Voice Channel</button>
+                <button id="leave-voice" style="display: none;">Leave Voice Channel</button>
+                <div id="voice-status">Voice Channel: Inactive</div>
+            </div>
             
             <div id="username-container">
                 <input type="text" id="username-input" placeholder="Enter your username">
@@ -368,6 +386,364 @@
             document.getElementById('error-message').textContent = 'Error connecting to database: ' + error.message;
             document.getElementById('error-message').style.display = 'block';
         }
+
+                // WebRTC Configuration
+const configuration = {
+    iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        // Free TURN server from Metered
+        { 
+            urls: 'turn:a.relay.metered.ca:80',
+            username: 'e8dd65f92a6b9e5ed0d82952',
+            credential: 'uWdWNmkhvVry/JYG'
+        },
+        {
+            urls: 'turn:a.relay.metered.ca:443',
+            username: 'e8dd65f92a6b9e5ed0d82952',
+            credential: 'uWdWNmkhvVry/JYG'
+        }
+    ]
+};
+
+// Voice Channel Elements
+const joinVoiceButton = document.getElementById('join-voice');
+const leaveVoiceButton = document.getElementById('leave-voice');
+const voiceStatus = document.getElementById('voice-status');
+let localStream = null;
+let peerConnections = {};
+let voiceChannelRef = database.ref('voice_channel');
+let isInVoiceChannel = false;
+
+// Join Voice Channel
+joinVoiceButton.addEventListener('click', async () => {
+    try {
+        // Update UI first to show we're attempting to join
+        voiceStatus.textContent = 'Voice Channel: Connecting...';
+        
+        // Get user media (microphone)
+        localStream = await navigator.mediaDevices.getUserMedia({ 
+            audio: true,
+            echoCancellation: true,
+            noiseSuppression: true
+        });
+        
+        // Update UI
+        joinVoiceButton.style.display = 'none';
+        leaveVoiceButton.style.display = 'inline-block';
+        voiceStatus.textContent = 'Voice Channel: Active';
+        isInVoiceChannel = true;
+
+        // Announce presence in voice channel
+        const participantRef = voiceChannelRef.child('participants').child(userId);
+        await participantRef.set({
+            username: username,
+            timestamp: firebase.database.ServerValue.TIMESTAMP
+        });
+
+        // Set cleanup on disconnect
+        participantRef.onDisconnect().remove();
+        
+        // Create audio output element for testing
+        const localAudio = document.createElement('audio');
+        localAudio.id = 'local-audio';
+        localAudio.muted = true; // Mute local audio to prevent feedback
+        localAudio.style.display = 'none';
+        localAudio.srcObject = localStream;
+        document.body.appendChild(localAudio);
+        localAudio.play().catch(e => console.error("Error playing local audio:", e));
+
+        // Find existing participants and establish connections
+        const snapshot = await voiceChannelRef.child('participants').once('value');
+        snapshot.forEach((childSnapshot) => {
+            const participantId = childSnapshot.key;
+            if (participantId !== userId) {
+                createPeerConnection(participantId, true); // true means we are the initiator
+            }
+        });
+
+        // Listen for new participants
+        voiceChannelRef.child('participants').on('child_added', (snapshot) => {
+            const participantId = snapshot.key;
+            if (participantId !== userId && !peerConnections[participantId] && isInVoiceChannel) {
+                // Create a new peer connection for this participant
+                createPeerConnection(participantId, true);
+            }
+        });
+
+        // Handle participant leaving
+        voiceChannelRef.child('participants').on('child_removed', (snapshot) => {
+            const participantId = snapshot.key;
+            cleanupPeerConnection(participantId);
+        });
+
+        // Handle signaling messages
+        voiceChannelRef.child('signaling').on('child_added', async (snapshot) => {
+            try {
+                const message = snapshot.val();
+                
+                // Only process messages intended for us
+                if (message.to !== userId) return;
+                
+                const senderId = message.from;
+                
+                // Create peer connection if it doesn't exist
+                if (!peerConnections[senderId]) {
+                    createPeerConnection(senderId, false);
+                }
+                
+                const pc = peerConnections[senderId];
+                
+                if (message.type === 'offer') {
+                    console.log("Received offer from", senderId);
+                    await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    
+                    // Send answer back
+                    await voiceChannelRef.child('signaling').push({
+                        type: 'answer',
+                        sdp: pc.localDescription,
+                        from: userId,
+                        to: senderId
+                    });
+                    
+                } else if (message.type === 'answer') {
+                    console.log("Received answer from", senderId);
+                    await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
+                    
+                } else if (message.type === 'candidate') {
+                    console.log("Received ICE candidate from", senderId);
+                    // Check if we can add the candidate immediately
+                    if (pc.remoteDescription) {
+                        await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+                    } else {
+                        // Queue the candidate for later
+                        console.log("Queueing ICE candidate as remote description not set yet");
+                        setTimeout(async () => {
+                            try {
+                                if (pc.remoteDescription) {
+                                    await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+                                }
+                            } catch (e) {
+                                console.error("Error adding queued ICE candidate:", e);
+                            }
+                        }, 1000);
+                    }
+                }
+                
+                // Clean up signaling message
+                await snapshot.ref.remove();
+                
+            } catch (error) {
+                console.error("Error processing signaling message:", error);
+                await snapshot.ref.remove(); // Remove the message if there was an error
+            }
+        });
+
+    } catch (error) {
+        console.error("Error joining voice channel:", error);
+        voiceStatus.textContent = 'Error joining voice channel: ' + error.message;
+        resetVoiceChannel();
+    }
+});
+
+// Create a peer connection with another participant
+async function createPeerConnection(participantId, isInitiator) {
+    try {
+        console.log(`Creating ${isInitiator ? 'initiator' : 'receiver'} connection with ${participantId}`);
+        
+        // Create new peer connection
+        const pc = new RTCPeerConnection(configuration);
+        peerConnections[participantId] = pc;
+        
+        // Add local stream tracks to the connection
+        if (localStream) {
+            localStream.getTracks().forEach(track => {
+                pc.addTrack(track, localStream);
+                console.log("Added local track to peer connection");
+            });
+        }
+        
+        // Handle ICE candidates
+        pc.onicecandidate = async (event) => {
+            if (event.candidate) {
+                console.log("Generated ICE candidate for", participantId);
+                try {
+                    await voiceChannelRef.child('signaling').push({
+                        type: 'candidate',
+                        candidate: event.candidate,
+                        from: userId,
+                        to: participantId
+                    });
+                } catch (e) {
+                    console.error("Error sending ICE candidate:", e);
+                }
+            }
+        };
+        
+        // Log connection state changes
+        pc.onconnectionstatechange = () => {
+            console.log(`Connection state change: ${pc.connectionState} with ${participantId}`);
+            
+            // Clean up failed connections after some time
+            if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                setTimeout(() => {
+                    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                        cleanupPeerConnection(participantId);
+                    }
+                }, 5000);
+            }
+        };
+        
+        // Log ICE connection state changes
+        pc.oniceconnectionstatechange = () => {
+            console.log(`ICE connection state change: ${pc.iceConnectionState} with ${participantId}`);
+        };
+        
+        // Handle incoming stream
+        pc.ontrack = (event) => {
+            console.log("Received remote track from", participantId);
+            // Create or update audio element for remote stream
+            let audioElement = document.getElementById(`audio-${participantId}`);
+            if (!audioElement) {
+                audioElement = document.createElement('audio');
+                audioElement.id = `audio-${participantId}`;
+                audioElement.autoplay = true;
+                audioElement.controls = false; // You can set to true for debugging
+                audioElement.style.display = 'none';
+                document.body.appendChild(audioElement);
+            }
+            
+            audioElement.srcObject = event.streams[0];
+            audioElement.play().catch(e => console.error("Error playing remote audio:", e));
+            
+            // Show indicator that audio is coming in
+            voiceStatus.textContent = `Voice Channel: Active (${Object.keys(peerConnections).length} connections)`;
+        };
+        
+        // If we're the initiator, create and send an offer
+        if (isInitiator) {
+            try {
+                const offer = await pc.createOffer({
+                    offerToReceiveAudio: true,
+                    voiceActivityDetection: true
+                });
+                await pc.setLocalDescription(offer);
+                
+                console.log("Sending offer to", participantId);
+                await voiceChannelRef.child('signaling').push({
+                    type: 'offer',
+                    sdp: pc.localDescription,
+                    from: userId,
+                    to: participantId
+                });
+            } catch (e) {
+                console.error("Error creating or sending offer:", e);
+                cleanupPeerConnection(participantId);
+            }
+        }
+        
+        return pc;
+    } catch (error) {
+        console.error("Error creating peer connection:", error);
+        return null;
+    }
+}
+
+// Clean up a peer connection
+function cleanupPeerConnection(participantId) {
+    console.log("Cleaning up connection with", participantId);
+    const pc = peerConnections[participantId];
+    if (pc) {
+        pc.ontrack = null;
+        pc.onicecandidate = null;
+        pc.oniceconnectionstatechange = null;
+        pc.onconnectionstatechange = null;
+        pc.close();
+        delete peerConnections[participantId];
+    }
+    
+    // Remove the audio element if it exists
+    const audioElement = document.getElementById(`audio-${participantId}`);
+    if (audioElement) {
+        audioElement.pause();
+        audioElement.srcObject = null;
+        audioElement.remove();
+    }
+    
+    // Update UI to reflect participant count
+    if (isInVoiceChannel) {
+        const connCount = Object.keys(peerConnections).length;
+        voiceStatus.textContent = connCount > 0 
+            ? `Voice Channel: Active (${connCount} connections)` 
+            : 'Voice Channel: Active (No other participants)';
+    }
+}
+
+// Leave Voice Channel
+leaveVoiceButton.addEventListener('click', () => {
+    resetVoiceChannel();
+});
+
+// Reset voice channel state
+function resetVoiceChannel() {
+    console.log("Resetting voice channel");
+    isInVoiceChannel = false;
+    
+    // Stop local stream
+    if (localStream) {
+        localStream.getTracks().forEach(track => {
+            track.stop();
+            console.log("Stopped local track:", track.kind);
+        });
+        localStream = null;
+    }
+    
+    // Remove local audio element
+    const localAudio = document.getElementById('local-audio');
+    if (localAudio) {
+        localAudio.pause();
+        localAudio.srcObject = null;
+        localAudio.remove();
+    }
+
+    // Close all peer connections
+    Object.keys(peerConnections).forEach(cleanupPeerConnection);
+    peerConnections = {};
+
+    // Remove participant from voice channel
+    if (userId) {
+        voiceChannelRef.child('participants').child(userId).remove();
+    }
+
+    // Update UI
+    joinVoiceButton.style.display = 'inline-block';
+    leaveVoiceButton.style.display = 'none';
+    voiceStatus.textContent = 'Voice Channel: Inactive';
+}
+
+// Clean up on page unload
+window.addEventListener('beforeunload', () => {
+    resetVoiceChannel();
+});
+
+// Add debugging for voice connections
+window.debugVoice = function() {
+    console.log("=== VOICE DEBUG INFO ===");
+    console.log("In voice channel:", isInVoiceChannel);
+    console.log("Local stream:", localStream ? "Active" : "None");
+    console.log("Connections:", Object.keys(peerConnections).length);
+    
+    Object.entries(peerConnections).forEach(([id, pc]) => {
+        console.log(`Connection to ${id}:`, {
+            connectionState: pc.connectionState,
+            iceConnectionState: pc.iceConnectionState,
+            iceGatheringState: pc.iceGatheringState,
+            signalingState: pc.signalingState
+        });
+    });
+};
 
         // Elements
         const chatBox = document.getElementById('chat-box');
